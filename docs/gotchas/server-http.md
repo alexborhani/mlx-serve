@@ -2680,8 +2680,11 @@ connection thread's residency and digests come from that view, so Qwen's 567 MB 
 deferral (`pinnedResidentBytes > 0`) never fired, and a prompt matching 2926 of 3002 tokens billed
 cold. Unloading bge, the current model, cleared the view outright.
 
-Fix: only a chat-capable model takes the view (`takesHotCacheView` = `ModelRegistry.chatCapable`); an
-unload clears it only when it is that model's own cache (`unloadDropsHotCacheView`).
+Fix: every loader runs the same hookup (`adoptHotCacheView`): only a chat-capable model with an MLX
+cache takes the view, so an encoder, a media model, a ds4 or a llama.cpp load leaves it where it is.
+An unload drops the view only when it is that model's own cache (`unloadDropsHotCacheView`), and then
+hands it to the default chat model's cache, or any resident one (`inheritedHotCacheView`), so a chat
+model left resident keeps its warm turns billed.
 Not fixed: a turn whose warm bill still exceeds free memory is refused by the prefill thread, now
 quoting the real residency, and bge stays loaded. The cache survives, so a resend restores warm: 0.6 s
 against 12.3 s cold in an A/B on LFM2.5-2.6B with `--os-reserve-gib 12` and 3.5 GB held before the turn.

@@ -3116,7 +3116,7 @@ fn doLoadDs4OnInferenceThread(sch: *Scheduler, params: anytype) !void {
     sch.vision_encoder = null;
     sch.drafter = null;
     sch.dflash = null;
-    sch.hot_prefix_cache = null;
+    adoptHotCacheView(sch, entry);
     publishHotCacheResidency(sch);
     if (hot_cache_budget_invalidate) |f| f();
 }
@@ -3206,7 +3206,7 @@ fn doLoadLlamaOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     sch.vision_encoder = null;
     sch.drafter = null;
     sch.dflash = null;
-    sch.hot_prefix_cache = null;
+    adoptHotCacheView(sch, entry);
     publishHotCacheResidency(sch);
     if (hot_cache_budget_invalidate) |f| f();
 }
@@ -3376,7 +3376,7 @@ fn doLoadGenOnInferenceThread(sch: *Scheduler, params: anytype, modality: gen_mo
     sch.vision_encoder = null;
     sch.drafter = null;
     sch.dflash = null;
-    sch.hot_prefix_cache = null;
+    adoptHotCacheView(sch, entry);
     publishHotCacheResidency(sch);
     if (hot_cache_budget_invalidate) |f| f();
 }
@@ -4999,17 +4999,48 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     sch.vision_encoder = vision_ptr;
     sch.drafter = drafter_ptr;
     sch.dflash = dflash_ptr;
-    if (entry.prefix_cache) |*hc| {
-        if (takesHotCacheView(entry)) sch.hot_prefix_cache = hc;
-    }
+    adoptHotCacheView(sch, entry);
     publishHotCacheResidency(sch);
 }
 
 /// The view is what the connection thread bills a warm turn against, so only a model that
-/// serves chat takes it: an embedding encoder loaded beside the chat model would publish its
-/// own empty cache, and the chat model's warm prefix would read as gone (#854).
+/// serves chat takes it: an encoder or media model loaded beside the chat model would publish
+/// its own empty cache, and the chat model's warm prefix would read as gone.
 fn takesHotCacheView(entry: *const LoadedModel) bool {
     return ModelRegistry.chatCapable(entry);
+}
+
+/// Every loader's one hookup. A chat model without an MLX cache (ds4, llama.cpp) is billed
+/// outside the guard, so it leaves the view on the resident MLX chat model too.
+fn adoptHotCacheView(sch: *Scheduler, entry: *LoadedModel) void {
+    if (!takesHotCacheView(entry)) return;
+    const hc = if (entry.prefix_cache) |*h| h else return;
+    sch.hot_prefix_cache = hc;
+}
+
+/// Can `candidate` take the view that `unloading` is giving up: resident, serving chat, with a
+/// cache of its own.
+fn canInheritHotCacheView(candidate: *const LoadedModel, unloading: *const LoadedModel) bool {
+    if (candidate == unloading or candidate.state != .ready) return false;
+    if (!takesHotCacheView(candidate)) return false;
+    return candidate.prefix_cache != null;
+}
+
+/// The view after its owner unloads: the default model's cache when it can take it, else any
+/// resident chat model's, else none. A chat model left resident keeps its warm turns billed.
+fn inheritedHotCacheView(reg: *ModelRegistry, unloading: *const LoadedModel) ?*prefix_cache_mod.HotPrefixCache {
+    reg.mutex.lockUncancelable(reg.io);
+    defer reg.mutex.unlock(reg.io);
+    var fallback: ?*prefix_cache_mod.HotPrefixCache = null;
+    var it = reg.entries.valueIterator();
+    while (it.next()) |entry_ptr| {
+        const entry = entry_ptr.*;
+        if (!canInheritHotCacheView(entry, unloading)) continue;
+        const hc = &entry.prefix_cache.?;
+        if (std.mem.eql(u8, reg.default_id, entry.id)) return hc;
+        if (fallback == null) fallback = hc;
+    }
+    return fallback;
 }
 
 /// Unloading `entry` drops the hot-cache view only when the view is its own cache; another
@@ -5999,7 +6030,7 @@ fn runUnloadRequest(sch: *Scheduler, req: *UnloadRequest) void {
         sch.drafter = null;
         sch.dflash = null;
     }
-    if (drops_view) sch.hot_prefix_cache = null;
+    if (drops_view) sch.hot_prefix_cache = inheritedHotCacheView(sch.registry, entry);
     if (was_current or drops_view) {
         publishHotCacheResidency(sch);
         if (hot_cache_budget_invalidate) |f| f();
@@ -11856,6 +11887,74 @@ test "the hot-cache view follows a chat model, never an embedding encoder (#854)
     }
     try testing.expect(takesHotCacheView(chat));
     try testing.expect(!takesHotCacheView(bge));
+}
+
+test "a media model's load leaves the hot-cache view on the chat model" {
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 4, 0, null);
+    defer reg.deinit();
+    var sch: Scheduler = undefined;
+    sch.hot_prefix_cache = null;
+    const chat = try reg.registerStub("qwen", "/m/qwen", 64);
+    var chat_cfg = model_mod.ModelConfig{};
+    chat_cfg.model_type = "qwen3_5";
+    chat.config = &chat_cfg;
+    chat.prefix_cache = prefix_cache_mod.HotPrefixCache.init(testing.allocator, 4);
+    const tts = try reg.registerStub("kokoro", "/m/kokoro", 64);
+    var tts_cfg = model_mod.ModelConfig{};
+    tts_cfg.model_type = "kokoro";
+    tts.config = &tts_cfg;
+    const gguf = try reg.registerStub("gguf", "/m/gguf", 64);
+    var gguf_cfg = model_mod.ModelConfig{};
+    gguf_cfg.model_type = "llama";
+    gguf.config = &gguf_cfg;
+    defer {
+        chat.config = null;
+        tts.config = null;
+        gguf.config = null;
+    }
+    adoptHotCacheView(&sch, chat);
+    try testing.expectEqual(@as(?*prefix_cache_mod.HotPrefixCache, &chat.prefix_cache.?), sch.hot_prefix_cache);
+    adoptHotCacheView(&sch, tts);
+    try testing.expectEqual(@as(?*prefix_cache_mod.HotPrefixCache, &chat.prefix_cache.?), sch.hot_prefix_cache);
+    // Chat-capable, but no MLX cache to bill against.
+    adoptHotCacheView(&sch, gguf);
+    try testing.expectEqual(@as(?*prefix_cache_mod.HotPrefixCache, &chat.prefix_cache.?), sch.hot_prefix_cache);
+}
+
+test "the view passes to the default chat model when its owner unloads, else to any resident one" {
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 4, 0, null);
+    defer reg.deinit();
+    const a = try reg.registerStub("a", "/m/a", 64);
+    const b = try reg.registerStub("b", "/m/b", 64);
+    const c = try reg.registerStub("c", "/m/c", 64);
+    var cfg = model_mod.ModelConfig{};
+    cfg.model_type = "qwen3_5";
+    a.config = &cfg;
+    b.config = &cfg;
+    c.config = &cfg;
+    defer {
+        a.config = null;
+        b.config = null;
+        c.config = null;
+    }
+    for ([_]*LoadedModel{ a, b, c }) |e| {
+        e.state = .ready;
+        e.prefix_cache = prefix_cache_mod.HotPrefixCache.init(testing.allocator, 4);
+    }
+    reg.default_id = "a";
+    try testing.expectEqual(@as(?*prefix_cache_mod.HotPrefixCache, &a.prefix_cache.?), inheritedHotCacheView(reg, b));
+    // The default is the one unloading: any other resident chat model will do.
+    const after_a = inheritedHotCacheView(reg, a);
+    try testing.expect(after_a == &b.prefix_cache.? or after_a == &c.prefix_cache.?);
+    // Nothing resident keeps the view.
+    b.state = .unloaded;
+    c.state = .unloaded;
+    try testing.expectEqual(@as(?*prefix_cache_mod.HotPrefixCache, null), inheritedHotCacheView(reg, a));
+    // An unloaded model, or one without a cache, cannot inherit.
+    try testing.expect(!canInheritHotCacheView(b, a));
+    c.state = .ready;
+    c.prefix_cache = null;
+    try testing.expect(!canInheritHotCacheView(c, a));
 }
 
 test "an unload drops the hot-cache view only when it is that model's own cache (#854)" {
