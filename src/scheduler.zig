@@ -4999,8 +4999,25 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     sch.vision_encoder = vision_ptr;
     sch.drafter = drafter_ptr;
     sch.dflash = dflash_ptr;
-    if (entry.prefix_cache) |*hc| sch.hot_prefix_cache = hc;
+    if (entry.prefix_cache) |*hc| {
+        if (takesHotCacheView(entry)) sch.hot_prefix_cache = hc;
+    }
     publishHotCacheResidency(sch);
+}
+
+/// The view is what the connection thread bills a warm turn against, so only a model that
+/// serves chat takes it: an embedding encoder loaded beside the chat model would publish its
+/// own empty cache, and the chat model's warm prefix would read as gone (#854).
+fn takesHotCacheView(entry: *const LoadedModel) bool {
+    return ModelRegistry.chatCapable(entry);
+}
+
+/// Unloading `entry` drops the hot-cache view only when the view is its own cache; another
+/// model's stays published.
+fn unloadDropsHotCacheView(view: ?*const prefix_cache_mod.HotPrefixCache, entry: *const LoadedModel) bool {
+    const v = view orelse return false;
+    const own = if (entry.prefix_cache) |*hc| hc else return false;
+    return v == own;
 }
 
 /// Republish the hot cache's residency for the connection thread's admission guard.
@@ -5964,6 +5981,7 @@ fn runUnloadRequest(sch: *Scheduler, req: *UnloadRequest) void {
         entry.id,
         @as(f64, @floatFromInt(bytes)) / 1_073_741_824.0,
     });
+    const drops_view = unloadDropsHotCacheView(sch.hot_prefix_cache, entry);
     entry.unloadResident();
     // unloadResident freed the arrays into MLX's allocator cache — clear it
     // so the unload actually returns the memory to the OS (the whole point
@@ -5972,14 +5990,17 @@ fn runUnloadRequest(sch: *Scheduler, req: *UnloadRequest) void {
     // Drop any borrowed views that pointed at this entry so post-unload reads
     // don't dangle (gen entries leave xfm null already, but an LLM unload
     // must clear them).
-    if (sch.current_model == entry) {
+    const was_current = sch.current_model == entry;
+    if (was_current) {
         sch.current_model = null;
         sch.xfm = null;
         sch.weights = null;
         sch.vision_encoder = null;
         sch.drafter = null;
         sch.dflash = null;
-        sch.hot_prefix_cache = null;
+    }
+    if (drops_view) sch.hot_prefix_cache = null;
+    if (was_current or drops_view) {
         publishHotCacheResidency(sch);
         if (hot_cache_budget_invalidate) |f| f();
     }
@@ -11814,4 +11835,39 @@ test "loop recovery: an answer-side loop and an unarmed request are still cut" {
     const closed = [_]u32{ 5, 6, CLOSE, 7, 8 };
     try testing.expectEqual(LoopAction.cut, loopRecoveryAction(&tb, &closed, 5, 4096));
     try testing.expectEqual(LoopAction.cut, loopRecoveryAction(null, &closed, 5, 4096));
+}
+
+test "the hot-cache view follows a chat model, never an embedding encoder (#854)" {
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 4, 0, null);
+    defer reg.deinit();
+    const chat = try reg.registerStub("qwen", "/m/qwen", 64);
+    var chat_cfg = model_mod.ModelConfig{};
+    chat_cfg.model_type = "qwen3_5";
+    chat.config = &chat_cfg;
+    const bge = try reg.registerStub("bge", "/m/bge", 64);
+    var bge_cfg = model_mod.ModelConfig{};
+    bge_cfg.model_type = "bert";
+    bge_cfg.is_encoder_only = true;
+    bge.config = &bge_cfg;
+    // The configs live on this stack; the registry frees what an entry owns.
+    defer {
+        chat.config = null;
+        bge.config = null;
+    }
+    try testing.expect(takesHotCacheView(chat));
+    try testing.expect(!takesHotCacheView(bge));
+}
+
+test "an unload drops the hot-cache view only when it is that model's own cache (#854)" {
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 4, 0, null);
+    defer reg.deinit();
+    const chat = try reg.registerStub("qwen", "/m/qwen", 64);
+    const bge = try reg.registerStub("bge", "/m/bge", 64);
+    // The registry frees each entry's cache.
+    chat.prefix_cache = prefix_cache_mod.HotPrefixCache.init(testing.allocator, 4);
+    bge.prefix_cache = prefix_cache_mod.HotPrefixCache.init(testing.allocator, 4);
+    const view: ?*prefix_cache_mod.HotPrefixCache = &chat.prefix_cache.?;
+    try testing.expect(!unloadDropsHotCacheView(view, bge));
+    try testing.expect(unloadDropsHotCacheView(view, chat));
+    try testing.expect(!unloadDropsHotCacheView(null, chat));
 }

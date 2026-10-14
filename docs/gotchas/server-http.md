@@ -2668,6 +2668,26 @@ Fix: before refusing, `checkAttentionMemory` unloads idle resident models least 
 after each, via `fitAfterUnloadingIdle`.
 Guard: `a prompt that does not fit unloads idle models, oldest first, until it fits` (server.zig).
 
+## An embedding model's load hid the chat model's warm cache (2026-10-14, #854)
+
+Defect: with bge-small loaded beside Qwen3.5-9B for an agent's knowledge search, the next turn of a
+tool-calling conversation got a 400 right after the previous turn ended, nothing else live
+(`needed=1117 MB available=50 MB ... ~0MB resident hot cache`, five times in one agent run). The
+make-room unload of bge then emptied Qwen's cache, the conversation's own checkpoint included.
+
+Cause: every load pointed `sch.hot_prefix_cache` at the loaded model's cache, an encoder's too. The
+connection thread's residency and digests come from that view, so Qwen's 567 MB read as 0, the warm
+deferral (`pinnedResidentBytes > 0`) never fired, and a prompt matching 2926 of 3002 tokens billed
+cold. Unloading bge, the current model, cleared the view outright.
+
+Fix: only a chat-capable model takes the view (`takesHotCacheView` = `ModelRegistry.chatCapable`); an
+unload clears it only when it is that model's own cache (`unloadDropsHotCacheView`).
+Not fixed: a turn whose warm bill still exceeds free memory is refused by the prefill thread, now
+quoting the real residency, and bge stays loaded. The cache survives, so a resend restores warm: 0.6 s
+against 12.3 s cold in an A/B on LFM2.5-2.6B with `--os-reserve-gib 12` and 3.5 GB held before the turn.
+Guard: `the hot-cache view follows a chat model, never an embedding encoder (#854)` and
+`an unload drops the hot-cache view only when it is that model's own cache (#854)` (scheduler.zig).
+
 ## A 16 GB Mac advertised 870 tokens beside a big model (2026-10-11)
 
 Defect: on an M4 16 GB, Qwen3.5-9B (7.6 GB) auto-sized to 870 tokens, gemma-4-e4b 8-bit to 870 and

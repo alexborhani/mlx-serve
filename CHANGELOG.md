@@ -9,7 +9,7 @@
 - **Sushi packs draft.** MiMo-V2.6-Flash Sushi packs draft with their own MTP heads and read their FP8 attention weights in place, about 105 tokens per second instead of 32 on an M5 Ultra, and GLM-5.3-Flash Sushi packs use the DFlash2 drafter they ship with, 94 instead of 66 on code.
 - **Coding agents in one line.** `curl -fsSL https://mlxserve.com/agent.sh | sh` sets up pi, Claude Code, oh-my-pi, OpenCode or Grok against your server, and agents started from the web console's Code Launcher no longer quit on launch.
 - **Use a Mac that shares with a key.** When another Mac shares its models behind an API key, it shows up in Settings > LAN Sharing as needing a key; enter it there and its models appear in your pickers. Headless: `~/.mlx-serve/lan-keys.json`.
-- **Fixes.** DeepSeek-V4-Flash GGUFs open again with default settings, a picture sent as a plain image URL string reaches the model instead of being silently dropped, a damaged LAN key file can no longer stall peer discovery, and LFM2.5-8B-A1B, LFM2.5-24B-A2B and Kolibri-1 downloads are no longer marked unsupported in the app.
+- **Fixes.** DeepSeek-V4-Flash GGUFs open again with default settings, a picture sent as a plain image URL string reaches the model instead of being silently dropped, a damaged LAN key file can no longer stall peer discovery, LFM2.5-8B-A1B, LFM2.5-24B-A2B and Kolibri-1 downloads are no longer marked unsupported in the app, and a chat model's prefix cache is no longer emptied when an embedding model loaded beside it is unloaded to make room, so an agent's next turn resumes warm.
 
 ---
 
