@@ -1,6 +1,7 @@
 const std = @import("std");
 const crt = @import("crt.zig");
 const builtin = @import("builtin");
+const mlx = @import("mlx.zig");
 const is_macos = builtin.os.tag == .macos;
 
 // ── macOS Mach externs ──
@@ -146,8 +147,22 @@ pub fn getProcAvailableMemBytes() u64 {
     return @intCast(os_proc_available_memory());
 }
 
-/// Total physical RAM (hw.memsize on Darwin; /proc/meminfo on Linux). 0 on failure.
+/// Where weights live in device memory (`mlx.weightsInDeviceMemory`: CUDA on Windows, WSL) the
+/// GPU's memory is what every gate bills, as unified memory is on a Mac; elsewhere the host's.
+pub fn memoryPool(device_weights: bool, device: u64, host: u64) u64 {
+    return if (device_weights) device else host;
+}
+
 pub fn getTotalMemBytes() u64 {
+    return memoryPool(mlx.weightsInDeviceMemory(), mlx.maxRecommendedWorkingSet(), hostTotalMemBytes());
+}
+
+pub fn getAvailableMemBytes() u64 {
+    return memoryPool(mlx.weightsInDeviceMemory(), mlx.freeDeviceMemory(), hostAvailableMemBytes());
+}
+
+/// Total physical RAM (hw.memsize on Darwin; /proc/meminfo on Linux). 0 on failure.
+fn hostTotalMemBytes() u64 {
     if (comptime builtin.os.tag == .windows) return windowsMemStatus().ullTotalPhys;
     if (comptime !builtin.os.tag.isDarwin()) return linuxMemInfoKib("MemTotal:") * 1024;
     var total_mem: u64 = 0;
@@ -156,7 +171,7 @@ pub fn getTotalMemBytes() u64 {
     return total_mem;
 }
 
-pub fn getAvailableMemBytes() u64 {
+fn hostAvailableMemBytes() u64 {
     if (comptime builtin.os.tag == .windows) return windowsMemStatus().ullAvailPhys;
     if (comptime !builtin.os.tag.isDarwin()) return linuxMemInfoKib("MemAvailable:") * 1024;
     var total_mem: u64 = 0;
@@ -234,6 +249,12 @@ fn readProcFile(path: []const u8, buf: []u8) ?usize {
     const n = crt.read(fd, buf);
     if (n <= 0) return null;
     return @intCast(n);
+}
+
+test "memoryPool: device-memory weights bill VRAM, every other platform its host reading" {
+    const GB: u64 = 1024 * 1024 * 1024;
+    try std.testing.expectEqual(15 * GB, memoryPool(true, 15 * GB, 9 * GB)); // Windows: 13 GB fits the card
+    try std.testing.expectEqual(20 * GB, memoryPool(false, 15 * GB, 20 * GB)); // managed memory pages to RAM
 }
 
 test "computeAvailableBytes sums the reclaimable classes, capped by wired headroom" {

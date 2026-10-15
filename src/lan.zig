@@ -1337,7 +1337,7 @@ test "lan: JSON-escaped slashes canonicalize (Swift clients send org\\/name)" {
     // No escapes → the INPUT slice comes back verbatim (zero-copy).
     const plain = "ddalcu/gemma-e2b@Mini";
     try t.expect(unescapeJsonSlashes(&buf, plain).ptr == plain.ptr);
-    // Only the two-byte sequence `\/` collapses; other backslashes survive.
+    // Only the escapes `\/` and `\\` collapse; other backslashes survive.
     try t.expectEqualStrings("a\\b/c", unescapeJsonSlashes(&buf, "a\\b\\/c"));
     // A Windows path id arrives with its backslashes escaped.
     try t.expectEqualStrings("C:\\Users\\m", unescapeJsonSlashes(&buf, "C:\\\\Users\\\\m"));

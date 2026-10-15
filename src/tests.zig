@@ -11,7 +11,7 @@ test {
     _ = @import("log.zig");
     _ = @import("os_mutex.zig");
     _ = @import("crt.zig");
-    _ = @import("win_socket.zig");
+    _ = @import("win_io.zig");
     _ = @import("arch/mlx_gguf.zig");
     _ = @import("version.zig");
     _ = @import("chat.zig");
@@ -104,10 +104,14 @@ test {
     _ = @import("gguf_meta.zig");
     _ = @import("model_registry.zig");
     _ = @import("scheduler.zig");
-    _ = @import("ds4_ffi.zig");
-    _ = @import("arch/ds4.zig");
-    _ = @import("llama_ffi.zig");
-    _ = @import("arch/llama.zig");
+    if (@import("build_options").ds4_engine) {
+        _ = @import("ds4_ffi.zig");
+        _ = @import("arch/ds4.zig");
+    }
+    if (@import("build_options").llama_engine) {
+        _ = @import("llama_ffi.zig");
+        _ = @import("arch/llama.zig");
+    }
     _ = @import("wav.zig");
     _ = @import("tts.zig");
     _ = @import("flux.zig");

@@ -516,6 +516,7 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
     const exe = b.addExecutable(.{
         .name = "mlx-serve",
         .root_module = mods[0],
+        .win32_manifest = if (windows) b.path("src/windows/mlx-serve.manifest") else null,
     });
     b.installArtifact(exe);
 

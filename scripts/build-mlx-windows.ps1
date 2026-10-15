@@ -71,6 +71,7 @@ if ($LASTEXITCODE) { throw "mlx configure failed" }
 cmake --build (Join-Path $Work "mlx-build") --parallel
 if ($LASTEXITCODE) { throw "mlx build failed" }
 cmake --install (Join-Path $Work "mlx-build") --prefix $prefix | Out-Null
+if ($LASTEXITCODE) { throw "mlx install failed" }
 
 Write-Host "== build mlx-c"
 cmake -S $Mlxc -B (Join-Path $Work "mlxc-build") -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON `
@@ -80,6 +81,7 @@ if ($LASTEXITCODE) { throw "mlx-c configure failed" }
 cmake --build (Join-Path $Work "mlxc-build") --target mlxc --parallel
 if ($LASTEXITCODE) { throw "mlx-c build failed" }
 cmake --install (Join-Path $Work "mlxc-build") --prefix $prefix | Out-Null
+if ($LASTEXITCODE) { throw "mlx-c install failed" }
 
 Write-Host "== stage $Stage"
 Remove-Item -Recurse -Force $Stage -ErrorAction SilentlyContinue

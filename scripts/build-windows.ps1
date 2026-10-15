@@ -33,7 +33,7 @@ $zig = Join-Path $Root ".zig-toolchain\zig.exe"
 Bash "LLAMA_TARGET=windows scripts/fetch-llama.sh"
 
 # mlx-serve.
-$cpu = if ($env:ZIG_CPU) { @("-Dcpu=$env:ZIG_CPU") } else { @() }
+$cpu = @(if ($env:ZIG_CPU) { "-Dcpu=$env:ZIG_CPU" }) # @(): an `if` would unroll a one-item array to a string
 & $zig build -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseFast @cpu
 if ($LASTEXITCODE) { throw "zig build failed" }
 

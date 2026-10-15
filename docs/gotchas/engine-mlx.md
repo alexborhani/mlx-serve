@@ -5696,8 +5696,8 @@ Guard: `standard forward: skip_lm_head hands back the hidden the head reads, nev
 
 Defect: on Windows (and WSL) Qwen3-0.6B decoded at 28 tok/s against mlx-lm's 130 on the same GPU; FLUX and ACE-Step ran 3-5x slow. The same quantized matmul kernel took 270 us per call against mlx-lm's 10 (nsys).
 Cause: every loader read safetensors on MLX's CPU stream. A stream-less allocation is managed memory, which native Linux migrates to the GPU, but without concurrent managed access MLX backs it with `cudaMallocHost`, which never moves: each token re-read the weights over PCIe. mlx-lm loads on the GPU stream.
-Fix: `mlx.weightLoadStream()` is the GPU stream on CUDA where unified memory is limited (Windows at compile time, WSL by kernel release), else the CPU stream (Metal has no GPU `Load`); every weight loader and the SSD KV restore take it, and the load budget there is free VRAM (`loadBudget`).
-Guard: `weight loads go to the GPU on CUDA only where host memory never migrates there`, `loadBudget: ...`; live, 145 tok/s.
+Fix: `mlx.weightLoadStream()` is the GPU stream on CUDA where unified memory is limited (Windows at compile time, WSL by kernel release), else the CPU stream (Metal has no GPU `Load`); every weight loader and the SSD KV restore take it, and there `status.get{Available,Total}MemBytes` report VRAM, so every gate bills the pool the weights live in.
+Guard: `weight loads go to the GPU on CUDA only where host memory never migrates there`, `memoryPool: ...`; live, 145 tok/s.
 
 ## Two cuBLAS copies left llama.cpp on the CPU (2026-10-14)
 

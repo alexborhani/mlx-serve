@@ -340,9 +340,6 @@ fn normVecKey(w: *const Weights, a: std.mem.Allocator, pfx: []const u8, sub: []c
     return normVec(w, k, s);
 }
 
-/// Load ONE safetensors file into a Weights map (CPU stream — Load::eval_gpu is
-/// Not Implemented). The iterator hands a +1 reference in `value`; transfer it
-/// straight into the map (the model.zig pattern) — copying+dropping leaks.
 const loadFileWeights = model_mod.loadWeightsFile;
 
 // ════════════════════════════════════════════════════════════════════════

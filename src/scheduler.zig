@@ -3785,15 +3785,7 @@ fn waitForUnload(need: u64, avail: u64, mark: model_registry_mod.UnloadMark, now
 }
 
 fn loadAvail(_: std.Io) u64 {
-    const device = mlx.weightsInDeviceMemory();
-    const host = if (device) 0 else effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), loadGpuLimit());
-    return loadBudget(device, if (device) mlx.freeDeviceMemory() else 0, host);
-}
-
-/// Weights loaded straight into device memory (`mlx.weightLoadStream`) never page, so free VRAM
-/// is their whole bound and host RAM none; everywhere else the host reading stands.
-fn loadBudget(device_weights: bool, vram_free: u64, host_avail: u64) u64 {
-    return if (device_weights) vram_free else host_avail;
+    return effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), loadGpuLimit());
 }
 
 fn pauseLoadAvail(io: std.Io) void {
@@ -3829,12 +3821,6 @@ fn loadGpuLimit() u64 {
 fn effectiveAvailableBytes(host_avail: u64, proc_avail: u64, gpu_limit: u64) u64 {
     const avail = if (proc_avail > 0) proc_avail else host_avail;
     return if (gpu_limit > 0) @min(avail, gpu_limit) else avail;
-}
-
-test "loadBudget: device-memory weights are bounded by free VRAM alone, others by the host reading" {
-    const GB: u64 = 1024 * 1024 * 1024;
-    try std.testing.expectEqual(15 * GB, loadBudget(true, 15 * GB, 9 * GB)); // Windows VM: 13 GB fits the card
-    try std.testing.expectEqual(20 * GB, loadBudget(false, 15 * GB, 20 * GB)); // managed memory pages to RAM
 }
 
 test "settledAvail: a refused reading waits while freed memory still reaches the OS" {

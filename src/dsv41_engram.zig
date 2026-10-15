@@ -254,7 +254,7 @@ pub const Table = struct {
     /// Layer `layer`'s table in `dir`; `index` is its position among the
     /// config's Engram layers.
     pub fn open(gpa: std.mem.Allocator, dir_path: []const u8, index: usize, layer: usize, rows: u64, head_dim: u32) !Table {
-        if (comptime @import("builtin").os.tag == .windows) return error.EngramUnsupportedOnWindows; // pread gather is POSIX-only
+        if (comptime @import("builtin").os.tag == .windows) return error.EngramUnsupportedOnWindows; // its tables open through std.c.open
         _ = index;
         var arena = std.heap.ArenaAllocator.init(gpa);
         defer arena.deinit();

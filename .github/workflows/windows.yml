@@ -53,9 +53,10 @@ jobs:
       - name: Check out submodules
         run: git submodule update --init --depth 1 --jobs 8
 
-      - name: Cache MLX stage
+      # Restored and saved as two steps, so a later failure still keeps the hour-long MLX build.
+      - name: Restore MLX stage
         id: mlx
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: lib/mlx-win
           key: mlx-windows-${{ steps.pins.outputs.mlx }}-${{ steps.pins.outputs.arch }}-${{ hashFiles('patches/mlx*.patch', 'scripts/build-mlx-windows.ps1') }}
@@ -84,6 +85,13 @@ jobs:
 
       - name: Build
         run: powershell -File scripts\build-windows.ps1
+
+      - name: Save MLX stage
+        if: always() && steps.mlx.outputs.cache-hit != 'true' && hashFiles('lib/mlx-win/.version') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: lib/mlx-win
+          key: ${{ steps.mlx.outputs.cache-primary-key }}
 
       - name: Check the exe starts (every DLL resolves)
         run: dist\mlx-serve-windows-x64\mlx-serve.exe --version

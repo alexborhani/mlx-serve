@@ -2651,8 +2651,6 @@ fn readFourier(w: *Weights, out: *[128]f32) !void {
     try readF32Data(try getW(w, "time_proj.weight"), out);
 }
 
-/// Load ONE safetensors file into a Weights map (CPU stream; iterator +1
-/// transferred into the map — the model.zig pattern).
 const loadFileWeights = model_mod.loadWeightsFile;
 
 // ════════════════════════════════════════════════════════════════════════

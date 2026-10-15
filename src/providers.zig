@@ -710,7 +710,7 @@ pub fn proxyChat(alloc: std.mem.Allocator, io: std.Io, up: Upstream, body: []con
     const head_end = while (true) {
         if (std.mem.indexOf(u8, acc.items, "\r\n\r\n")) |at| break at;
         if (acc.items.len > 64 * 1024) return error.ProviderUnreachable;
-        const n = pollRead(io, out, &buf, conn) catch return error.ProviderUnreachable;
+        const n = pollRead(out, &buf, conn) catch return error.ProviderUnreachable;
         if (n == 0) return error.ProviderUnreachable;
         acc.appendSlice(alloc, buf[0..n]) catch return error.ProviderUnreachable;
     };
@@ -720,7 +720,7 @@ pub fn proxyChat(alloc: std.mem.Allocator, io: std.Io, up: Upstream, body: []con
     conn.writeAll(our_head) catch return;
     if (acc.items.len > head_end + 4) conn.writeAll(acc.items[head_end + 4 ..]) catch return;
     while (true) {
-        const n = pollRead(io, out, &buf, conn) catch return;
+        const n = pollRead(out, &buf, conn) catch return;
         if (n == 0) return;
         conn.writeAll(buf[0..n]) catch return;
     }
@@ -728,8 +728,15 @@ pub fn proxyChat(alloc: std.mem.Allocator, io: std.Io, up: Upstream, body: []con
 
 /// Blocking read with a 1 s client-disconnect probe, so an abandoned chat
 /// tears curl down instead of paying the provider for the whole answer.
-fn pollRead(io: std.Io, out: std.Io.File, buf: []u8, conn: anytype) !usize {
-    if (comptime @import("builtin").os.tag == .windows) return pollReadWindows(io, out, buf, conn);
+fn pollRead(out: std.Io.File, buf: []u8, conn: anytype) !usize {
+    if (comptime @import("builtin").os.tag == .windows) {
+        const client = struct {
+            fn gone(c: @TypeOf(conn)) bool {
+                return c.peerClosed();
+            }
+        };
+        return @import("win_io.zig").readPolled(out.handle, buf, conn, client.gone) catch |e| if (e == error.Stopped) error.ClientGone else e;
+    }
     const fd = out.handle;
     while (true) {
         var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
@@ -744,24 +751,7 @@ fn pollRead(io: std.Io, out: std.Io.File, buf: []u8, conn: anytype) !usize {
     }
 }
 
-extern "kernel32" fn PeekNamedPipe(pipe: std.os.windows.HANDLE, buf: ?*anyopaque, size: u32, read: ?*u32, avail: ?*u32, left: ?*u32) callconv(.winapi) i32;
 
-/// `pollRead` for Windows, whose pipes take no poll(2): peek for bytes, probing the client
-/// each second while curl is quiet. A broken pipe is curl's EOF.
-fn pollReadWindows(io: std.Io, out: std.Io.File, buf: []u8, conn: anytype) !usize {
-    var quiet_ms: u32 = 0;
-    while (true) {
-        var avail: u32 = 0;
-        if (PeekNamedPipe(out.handle, null, 0, null, &avail, null) == 0) return 0;
-        if (avail > 0) return out.readStreaming(io, &.{buf[0..@min(buf.len, avail)]}) catch error.ReadFailed;
-        crt.sleepMs(20);
-        quiet_ms += 20;
-        if (quiet_ms >= 1000) {
-            quiet_ms = 0;
-            if (conn.peerClosed()) return error.ClientGone;
-        }
-    }
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests

@@ -119,6 +119,7 @@ pub fn cudaDllSearchPath(buf: []u8, cuda_path: []const u8, path: []const u8) ?[:
 /// llama.cpp's ggml-cuda binds the cuBLAS MLX uses: two copies in one process leave one engine on CPU.
 fn exportCudaDllPath() void {
     const cuda = std.c.getenv("CUDA_PATH") orelse return;
+    if (cuda[0] == 0) return; // an empty value would put the drive root's \bin first on PATH
     const path = std.c.getenv("PATH") orelse "";
     const buf = std.heap.page_allocator.alloc(u8, 64 * 1024) catch return;
     defer std.heap.page_allocator.free(buf);
@@ -136,9 +137,8 @@ pub fn exportCudaHome() void {
             return std.c.access(root ++ "/include/cuda.h", 0) == 0;
         }
     };
-    if (cudaHomeDefault(env_set, has.headers("/usr/local/cuda"), has.headers("/opt/cuda"))) |home| _ = setenv("CUDA_HOME", home, 0);
+    if (cudaHomeDefault(env_set, has.headers("/usr/local/cuda"), has.headers("/opt/cuda"))) |home| crt.setEnv("CUDA_HOME", home);
 }
-extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
 var cuda_cache: ?bool = null;
 

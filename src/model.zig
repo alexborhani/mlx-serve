@@ -5001,9 +5001,8 @@ pub fn reportF16Narrowing() void {
     narrowed_1d = 0;
 }
 
-/// Load ONE safetensors file into a Weights map, tensors as stored (lazy).
-/// Safetensors load runs on a CPU stream (Load::eval_gpu is Not Implemented —
-/// the GPU-stream path kills the whole server). The iterator hands a +1
+/// Load ONE safetensors file into a Weights map, tensors as stored (lazy), on
+/// `mlx.weightLoadStream()` (Metal has no GPU `Load`). The iterator hands a +1
 /// reference in `value`; it transfers straight into the map.
 pub fn loadWeightsFile(allocator: std.mem.Allocator, model_dir: []const u8, file: []const u8) !Weights {
     var w = Weights.init(allocator);

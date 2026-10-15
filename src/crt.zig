@@ -13,10 +13,10 @@ const win = struct {
     extern "c" fn _lseeki64(fd: c_int, offset: i64, whence: c_int) i64;
     extern "c" fn _mkdir(path: [*:0]const u8) c_int;
     extern "c" fn _unlink(path: [*:0]const u8) c_int;
-    extern "c" fn rename(old: [*:0]const u8, new: [*:0]const u8) c_int;
 
     const O_WRONLY = 0x1;
     const O_APPEND = 0x8;
+    const O_NOINHERIT = 0x80; // a spawned child (curl) never holds our files open
     const O_CREAT = 0x100;
     const O_TRUNC = 0x200;
     const O_BINARY = 0x8000;
@@ -29,13 +29,13 @@ const win = struct {
 pub fn openWrite(path: [*:0]const u8, truncate: bool) c_int {
     if (is_windows) {
         const mode: c_int = if (truncate) win.O_TRUNC else win.O_APPEND;
-        return win._open(path, win.O_WRONLY | win.O_CREAT | win.O_BINARY | mode, @as(c_int, win.S_IREAD | win.S_IWRITE));
+        return win._open(path, win.O_WRONLY | win.O_CREAT | win.O_BINARY | win.O_NOINHERIT | mode, @as(c_int, win.S_IREAD | win.S_IWRITE));
     }
     return std.c.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = !truncate, .TRUNC = truncate }, @as(std.c.mode_t, 0o644));
 }
 
 pub fn openRead(path: [*:0]const u8) c_int {
-    if (is_windows) return win._open(path, win.O_BINARY);
+    if (is_windows) return win._open(path, win.O_BINARY | win.O_NOINHERIT);
     return std.c.open(path, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
 }
 
@@ -66,12 +66,11 @@ pub fn mkdir(path: [*:0]const u8) void {
     _ = if (is_windows) win._mkdir(path) else std.c.mkdir(path, @as(std.c.mode_t, 0o755));
 }
 
-/// Replaces an existing `new` on every OS (the Windows CRT refuses to, so it unlinks first).
+extern "kernel32" fn MoveFileExA(old: [*:0]const u8, new: [*:0]const u8, flags: u32) callconv(.winapi) i32;
+
+/// Atomically replaces an existing `new` on every OS (the Windows CRT's rename refuses to).
 pub fn rename(old: [*:0]const u8, new: [*:0]const u8) c_int {
-    if (is_windows) {
-        _ = win._unlink(new);
-        return win.rename(old, new);
-    }
+    if (is_windows) return if (MoveFileExA(old, new, 0x1) != 0) 0 else -1; // MOVEFILE_REPLACE_EXISTING
     return std.c.rename(old, new);
 }
 

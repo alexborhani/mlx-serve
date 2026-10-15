@@ -2361,8 +2361,6 @@ pub const Engine = struct {
     }
 };
 
-/// Load ONE safetensors file into a Weights map (CPU stream; the iterator's +1
-/// reference is transferred into the map — the model.zig pattern).
 const loadFileWeights = model_mod.loadWeightsFile;
 
 // ════════════════════════════════════════════════════════════════════════

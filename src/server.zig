@@ -1,6 +1,6 @@
 const std = @import("std");
 const crt = @import("crt.zig");
-const win_socket = @import("win_socket.zig");
+const win_io = @import("win_io.zig");
 const builtin = @import("builtin");
 const mlx = @import("mlx.zig");
 const transformer_mod = @import("transformer.zig");
@@ -461,8 +461,8 @@ pub const Conn = struct {
         c.stream.shutdown(c.io, .send) catch {};
         const deadline = nowMsMonotonic(c.io) + CLOSE_WAIT_MS;
         while (nowMsMonotonic(c.io) < deadline and !shutdown_requested.load(.acquire)) {
-            const ev = win_socket.poll(h, win_socket.RECEIVE | win_socket.GONE, 500) catch break;
-            if (ev & win_socket.GONE != 0) break;
+            const ev = win_io.poll(h, win_io.RECEIVE | win_io.GONE, 500) catch break;
+            if (ev & win_io.GONE != 0) break;
             // A byte from a pipelining client is dropped.
             if (ev != 0) _ = c.reader().discard(.limited(256)) catch break;
         }
@@ -471,7 +471,7 @@ pub const Conn = struct {
 
     pub fn peerClosed(c: *Conn) bool {
         if (comptime builtin.os.tag == .windows)
-            return (win_socket.poll(c.stream.socket.handle, win_socket.GONE, 0) catch return false) != 0;
+            return (win_io.poll(c.stream.socket.handle, win_io.GONE, 0) catch return false) != 0;
         const fd = c.stream.socket.handle;
         var fds = [_]std.posix.pollfd{.{
             .fd = fd,
@@ -1824,7 +1824,8 @@ fn deinitGlobalResponseStore() void {
 /// the socket already bound, so clearing it after bind is enough.
 fn listenExclusive(io: std.Io, addr: std.Io.net.IpAddress) !std.Io.net.Server {
     if (comptime builtin.os.tag == .linux) return listenExclusiveLinux(addr);
-    // Windows' SO_REUSEADDR lets a second process steal a bound port; its default bind is already exclusive.
+    // Windows' SO_REUSEADDR lets another socket bind over a live listener, so it stays off. std.Io binds
+    // inside listen, so SO_EXCLUSIVEADDRUSE cannot be set first: a process that sets SO_REUSEADDR can still share the port.
     if (comptime builtin.os.tag == .windows) return addr.listen(io, .{});
     var server = try addr.listen(io, .{ .reuse_address = true });
     errdefer server.deinit(io);
@@ -1835,7 +1836,7 @@ fn listenExclusive(io: std.Io, addr: std.Io.net.IpAddress) !std.Io.net.Server {
 /// Whether `handle` turns readable (a connection to accept, bytes, or EOF) within `timeout_ms`.
 fn socketReadable(handle: std.Io.net.Socket.Handle, timeout_ms: i32) !bool {
     if (comptime builtin.os.tag == .windows)
-        return try win_socket.poll(handle, win_socket.RECEIVE | win_socket.ACCEPT | win_socket.GONE, timeout_ms) != 0;
+        return try win_io.poll(handle, win_io.RECEIVE | win_io.ACCEPT | win_io.GONE, timeout_ms) != 0;
     var fds = [_]std.posix.pollfd{.{ .fd = handle, .events = std.posix.POLL.IN, .revents = 0 }};
     return try std.posix.poll(&fds, timeout_ms) > 0;
 }
@@ -3707,8 +3708,11 @@ pub fn applyGpuCeilingEnv() void {
 /// Free RAM the plan never touches. MLX wires what it allocates, so planning down to the last
 /// free page leaves the OS nothing to reclaim: a 16 GB Mac died on wired memory (15.4 GB wired,
 /// 14 MB free) with every request admitted.
-pub fn osReserveBytes(total_ram: u64) u64 {
+/// `device_pool`: the memory is a GPU's own (`mlx.weightsInDeviceMemory`), whose free reading
+/// already counts every process, so no OS share is held back.
+pub fn osReserveBytes(total_ram: u64, device_pool: bool) u64 {
     if (os_reserve_override) |v| return v;
+    if (device_pool) return 0;
     return std.math.clamp(total_ram / 8, 2 << 30, 8 << 30);
 }
 
@@ -3734,7 +3738,7 @@ fn currentGpuMemoryCeiling(config: ?*const model_mod.ModelConfig, active_mem: u6
     return gpuCeilingWithWiredFloor(
         getGpuWorkingSetLimit(),
         active_mem +| @as(u64, cache_mem),
-        (metrics.getAvailableMemBytes() -| osReserveBytes(metrics.getTotalMemBytes())) +| ane_bytes,
+        (metrics.getAvailableMemBytes() -| osReserveBytes(metrics.getTotalMemBytes(), mlx.weightsInDeviceMemory())) +| ane_bytes,
         wiredCeilingFloorFor(config),
     ) -| ane_bytes;
 }
@@ -8217,9 +8221,10 @@ fn handleUnloadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_
         },
     };
 
-    const id_for_body = if (requested_id.len > 0) requested_id else "mlx-serve";
+    const id_for_body = try jsonEscape(allocator, if (requested_id.len > 0) requested_id else "mlx-serve");
+    defer allocator.free(id_for_body);
     const body = try std.fmt.allocPrint(allocator,
-        \\{{"model":{{"id":"{s}","object":"model","loaded":false,"state":"unloaded"}}}}
+        \\{{"model":{{"id":{s},"object":"model","loaded":false,"state":"unloaded"}}}}
     , .{id_for_body});
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "application/json", body);
@@ -13589,7 +13594,11 @@ fn handleLanProxy(allocator: std.mem.Allocator, stream: *Conn, l: *lan_mod.Lan, 
     };
     const bare_json = try jsonEscape(allocator, rid.bare); // canonical again, so a backslash is re-escaped
     defer allocator.free(bare_json);
-    const rewritten = try lan_mod.rewriteModelValue(allocator, body, full_id, bare_json[1 .. bare_json.len - 1]);
+    const rewritten = lan_mod.rewriteModelValue(allocator, body, full_id, bare_json[1 .. bare_json.len - 1]) catch |err| switch (err) {
+        // A `?model=` query names it, but only a body field can be rewritten for the hop.
+        error.ModelValueNotInBody => return sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "A remote model must be named in the JSON body's model field", 400),
+        else => |e| return e,
+    };
     defer allocator.free(rewritten);
     const key = l.peerKey(allocator, rid.peer);
     defer if (key) |k| allocator.free(k);
@@ -13616,7 +13625,11 @@ fn handleProviderProxy(allocator: std.mem.Allocator, stream: *Conn, prov: *provi
     defer up.deinit(allocator);
     const bare_json = try jsonEscape(allocator, up.bare); // canonical again, so a backslash is re-escaped
     defer allocator.free(bare_json);
-    const rewritten = try lan_mod.rewriteModelValue(allocator, body, full_id, bare_json[1 .. bare_json.len - 1]);
+    const rewritten = lan_mod.rewriteModelValue(allocator, body, full_id, bare_json[1 .. bare_json.len - 1]) catch |err| switch (err) {
+        // A `?model=` query names it, but only a body field can be rewritten for the hop.
+        error.ModelValueNotInBody => return sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "A remote model must be named in the JSON body's model field", 400),
+        else => |e| return e,
+    };
     defer allocator.free(rewritten);
     log.info("[providers] proxy \"{s}\" -> {s}/chat/completions\n", .{ up.bare, up.url });
     providers_mod.proxyChat(allocator, stream.io, up, rewritten, stream) catch {
@@ -24734,15 +24747,16 @@ test "checkAttentionMemory wires the CONFIG's key bound, not a dense seq" {
     try t.expect(std.mem.indexOf(u8, src, "ctxCacheShare(ctxSizingCacheReserve(config), ceiling, active_mem, transient) +| transient") != null);
 }
 
-test "osReserveBytes: an eighth of RAM, never under 2 GB or over 8 GB" {
+test "osReserveBytes: an eighth of RAM, never under 2 GB or over 8 GB; none of a GPU's own memory" {
     const gb: u64 = 1 << 30;
-    try std.testing.expectEqual(2 * gb, osReserveBytes(8 * gb));
-    try std.testing.expectEqual(2 * gb, osReserveBytes(16 * gb));
-    try std.testing.expectEqual(4 * gb, osReserveBytes(32 * gb));
-    try std.testing.expectEqual(8 * gb, osReserveBytes(128 * gb));
+    try std.testing.expectEqual(2 * gb, osReserveBytes(8 * gb, false));
+    try std.testing.expectEqual(2 * gb, osReserveBytes(16 * gb, false));
+    try std.testing.expectEqual(4 * gb, osReserveBytes(32 * gb, false));
+    try std.testing.expectEqual(8 * gb, osReserveBytes(128 * gb, false));
+    try std.testing.expectEqual(@as(u64, 0), osReserveBytes(16 * gb, true)); // free VRAM already counts every process
     os_reserve_override = try parseOsReserveGib("0");
     defer os_reserve_override = null;
-    try std.testing.expectEqual(@as(u64, 0), osReserveBytes(16 * gb));
+    try std.testing.expectEqual(@as(u64, 0), osReserveBytes(16 * gb, false));
     try std.testing.expectError(error.InvalidOsReserve, parseOsReserveGib("lots"));
 }
 
