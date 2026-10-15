@@ -2681,7 +2681,8 @@ wait for something that never comes, and the connection thread refused on its fi
 Fix: `finishSlot` stamps `last_finish_ms`. For `TURN_BOUNDARY_SETTLE_MS` after it, both doors
 re-bill every `TURN_BOUNDARY_REBILL_MS` until the prompt fits or the window ends: the connection
 thread in `checkAttentionMemory`, the scheduler through `holdsWhileSettling`, which the window
-itself ends. With nothing live, the loop never parks on a pending slot, so the settle hold paces
+itself ends. The window counts from the finish, not the prompt's arrival: a prompt held beside a
+live request arrived seconds before that request ended, and measured from arrival it got no window. With nothing live, the loop never parks on a pending slot, so the settle hold paces
 itself. A refusal that stands costs up to two seconds more than before.
 Guard: `a prompt that lands inside the settle window after a finish holds, then takes the refusal`
 (scheduler.zig).

@@ -2679,10 +2679,18 @@ pub fn turnBoundarySettling(sch: *const Scheduler, io: std.Io) bool {
     return withinTurnBoundary(io_util.nowMsMonotonic(io), sch.last_finish_ms.load(.monotonic), TURN_BOUNDARY_SETTLE_MS);
 }
 
-/// A pending prompt with nothing live holds through the settle window, then takes the refusal:
-/// the window is what ends the wait.
-pub fn holdsWhileSettling(settling: bool, waited_ms: i64, window_ms: i64) bool {
-    return settling and waited_ms < window_ms;
+/// A pending prompt with nothing live holds while the last finish is inside the settle window,
+/// then takes the refusal: the window is what ends the wait. Measured from the finish, not the
+/// prompt's arrival: a prompt held beside a live request arrived long before that request ended.
+pub fn holdsWhileSettling(since_finish_ms: i64, window_ms: i64) bool {
+    return since_finish_ms >= 0 and since_finish_ms < window_ms;
+}
+
+/// Ms since the last finish, or -1 when none has happened.
+pub fn sinceLastFinishMs(sch: *const Scheduler, io: std.Io) i64 {
+    const last = sch.last_finish_ms.load(.monotonic);
+    if (last == 0) return -1;
+    return io_util.nowMsMonotonic(io) - last;
 }
 
 /// Does a prefill needing `need` fit `avail` beside siblings' unallocated promises, a running
@@ -2716,8 +2724,8 @@ fn slotHoldsForMemory(sch: *Scheduler, slot: *Slot) bool {
     var active_now: usize = 0;
     _ = mlx.mlx_get_active_memory(&active_now);
     const fits = admissionFits(bill[0], bill[1], sch.promise_ledger.outstanding(active_now), sch.gen_reserve_bytes, live);
-    const waited_ms: i64 = @intCast(@divTrunc(slot.request_start_ts.untilNow(sch.io, .boot).nanoseconds, std.time.ns_per_ms));
-    const settling = holdsWhileSettling(turnBoundarySettling(sch, sch.io), waited_ms, TURN_BOUNDARY_SETTLE_MS);
+    const since_finish_ms = sinceLastFinishMs(sch, sch.io);
+    const settling = holdsWhileSettling(since_finish_ms, TURN_BOUNDARY_SETTLE_MS);
     if (!holdsForMemory(fits, live > 0 or sch.gen_reserve_bytes > 0 or settling)) {
         if (slot.memory_promised == 0) {
             slot.memory_promised = bill[0];
@@ -2730,7 +2738,7 @@ fn slotHoldsForMemory(sch: *Scheduler, slot: *Slot) bool {
         if (live > 0 or sch.gen_reserve_bytes > 0) {
             log.info("[admission] held: {d} tokens do not fit beside {d} live request(s) and {d} MB of media job; waiting for one to finish\n", .{ slot.full_prompt.len, live, sch.gen_reserve_bytes >> 20 });
         } else {
-            log.info("[admission] held: {d} tokens do not fit {d} ms after the last turn finished; re-billing for up to {d} ms\n", .{ slot.full_prompt.len, waited_ms, TURN_BOUNDARY_SETTLE_MS });
+            log.info("[admission] held: {d} tokens do not fit {d} ms after the last turn finished; re-billing for up to {d} ms\n", .{ slot.full_prompt.len, since_finish_ms, TURN_BOUNDARY_SETTLE_MS });
         }
     }
     // With nothing live, no decode tick paces the loop: pace the re-bill here.
@@ -11855,10 +11863,10 @@ test "a prompt that lands inside the settle window after a finish holds, then ta
     try testing.expect(withinTurnBoundary(1_500, 1_000, 2_000));
     try testing.expect(!withinTurnBoundary(3_000, 1_000, 2_000));
     try testing.expect(!withinTurnBoundary(1_500, 0, 2_000)); // nothing has finished yet
-    try testing.expect(holdsWhileSettling(true, 300, 2_000));
-    try testing.expect(!holdsWhileSettling(true, 2_000, 2_000)); // the window ends the wait
-    try testing.expect(!holdsWhileSettling(false, 300, 2_000));
+    try testing.expect(holdsWhileSettling(300, 2_000));
+    try testing.expect(!holdsWhileSettling(2_000, 2_000)); // the window ends the wait
+    try testing.expect(!holdsWhileSettling(-1, 2_000)); // nothing has finished yet
     // The hold rides the same gate as live company: never a wait that nothing ends.
-    try testing.expect(holdsForMemory(false, holdsWhileSettling(true, 300, 2_000)));
-    try testing.expect(!holdsForMemory(false, holdsWhileSettling(true, 2_000, 2_000)));
+    try testing.expect(holdsForMemory(false, holdsWhileSettling(300, 2_000)));
+    try testing.expect(!holdsForMemory(false, holdsWhileSettling(2_000, 2_000)));
 }
