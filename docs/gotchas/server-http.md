@@ -2668,6 +2668,22 @@ Fix: before refusing, `checkAttentionMemory` unloads idle resident models least 
 after each, via `fitAfterUnloadingIdle`.
 Guard: `a prompt that does not fit unloads idle models, oldest first, until it fits` (server.zig).
 
+## An unload's revise evicted the neighbour's warm cache (2026-10-14, #854)
+
+Defect: with Qwen3-TTS loaded beside LFM2.5-2.6B, unloading the TTS model, which returned 1.85 GB,
+logged `budget revised 341 -> 0 MB` for LFM and evicted its one entry, the conversation's own
+checkpoint. The next turn ran cold (12.3 s against 0.6 s warm). The same happened in the make-room
+unload inside a rebill, where the refused prompt would have restored from the evicted entry.
+
+Cause: the trap the #364 entry records, taken one step further. The revise right after an unload
+reads the system-free figure before the freed pages show up in it, so it resolves a budget lower
+than before the unload. `setBudget` shrinks by evicting, so a figure known to be stale threw away
+entries the settled revise ten seconds later would have kept.
+
+Fix: that one revise is `raise_only` (`revisedBudget`): it may raise a budget, never lower it. The
+revise before each prefill in the window after an unload stays `full` and does any honest shrink.
+Guard: `an unload's revise raises a hot-cache budget but never lowers it` (scheduler.zig).
+
 ## A 16 GB Mac advertised 870 tokens beside a big model (2026-10-11)
 
 Defect: on an M4 16 GB, Qwen3.5-9B (7.6 GB) auto-sized to 870 tokens, gemma-4-e4b 8-bit to 870 and

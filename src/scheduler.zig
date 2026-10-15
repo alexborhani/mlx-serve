@@ -5015,7 +5015,19 @@ pub const BudgetRevise = struct { exclude_bytes: u64 = 0, quiet: bool = false };
 /// load-time clamp read the machine with the other models on it and was never revisited, so
 /// a model loaded beside a large one kept a ~0 budget for life. Each cache's own resident
 /// entries are excluded from the read so a full cache cannot ratchet itself down.
-fn reviseHotCacheBudgets(sch: *Scheduler) void {
+/// How a revise may move a budget. The free-RAM figure an unload reads recovers over seconds,
+/// so the revise right after one may raise a budget but never lower it: lowering evicts, and
+/// the next prefill's revise (`budget_revise_sw`) reads the settled figure.
+const ReviseMode = enum { full, raise_only };
+
+/// The budget a revise sets. 0 is uncapped on either side, so it wins a raise-only revise.
+fn revisedBudget(mode: ReviseMode, current: u64, resolved: u64) u64 {
+    if (mode == .full) return resolved;
+    if (current == 0 or resolved == 0) return 0;
+    return @max(current, resolved);
+}
+
+fn reviseHotCacheBudgets(sch: *Scheduler, mode: ReviseMode) void {
     const resolve = sch.prefix_cache_mem_resolver orelse return;
     sch.registry.mutex.lockUncancelable(sch.io);
     // The resolver publishes the process-global budget the admission guard reads, so the
@@ -5030,7 +5042,8 @@ fn reviseHotCacheBudgets(sch: *Scheduler) void {
             if (!hc.ram_enabled) continue;
             const config = entry.config orelse continue;
             var idle: u64 = 0;
-            hc.setBudget(resolve(config, sch.prefix_cache_mem_bytes, .{ .exclude_bytes = hc.residentBytes(), .quiet = true }, &idle));
+            const resolved = resolve(config, sch.prefix_cache_mem_bytes, .{ .exclude_bytes = hc.residentBytes(), .quiet = true }, &idle);
+            hc.setBudget(revisedBudget(mode, hc.max_kv_bytes, resolved));
             hc.ssd_idle_mem = idle;
         }
     }
@@ -5228,7 +5241,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         _ = drainSideQueues(sch);
         if (load_req) |req| runLoadRequest(sch, req);
         if (unload_req) |req| runUnloadRequest(sch, req);
-        if (load_req != null or unload_req != null) reviseHotCacheBudgets(sch);
+        if (load_req != null or unload_req != null) reviseHotCacheBudgets(sch, if (load_req != null) .full else .raise_only);
         if (unload_req != null) sch.budget_revise_sw = io_util.Stopwatch.init(sch.io);
         if (gen_n > 0) runGenRequests(sch, gen_batch[0..gen_n]);
         if (chatPass(sch, .main) == .shutdown) break;
@@ -5377,7 +5390,7 @@ fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
 
     if (sch.budget_revise_sw) |sw| {
         if (sw.read() > BUDGET_REVISE_WINDOW_NS) sch.budget_revise_sw = null;
-        if (n_prefill > 0) reviseHotCacheBudgets(sch);
+        if (n_prefill > 0) reviseHotCacheBudgets(sch, .full);
     }
 
     // 2. Prefill each pending slot (heavy; mlx ops on this thread).
@@ -11814,4 +11827,19 @@ test "loop recovery: an answer-side loop and an unarmed request are still cut" {
     const closed = [_]u32{ 5, 6, CLOSE, 7, 8 };
     try testing.expectEqual(LoopAction.cut, loopRecoveryAction(&tb, &closed, 5, 4096));
     try testing.expectEqual(LoopAction.cut, loopRecoveryAction(null, &closed, 5, 4096));
+}
+
+test "an unload's revise raises a hot-cache budget but never lowers it" {
+    const mb: u64 = 1 << 20;
+    // The settled revise before a prefill moves either way.
+    try testing.expectEqual(200 * mb, revisedBudget(.full, 600 * mb, 200 * mb));
+    try testing.expectEqual(900 * mb, revisedBudget(.full, 600 * mb, 900 * mb));
+    // The unload-time one reads a stale figure: it may raise, never lower.
+    try testing.expectEqual(600 * mb, revisedBudget(.raise_only, 600 * mb, 200 * mb));
+    try testing.expectEqual(600 * mb, revisedBudget(.raise_only, 600 * mb, 0 * mb + 600 * mb));
+    try testing.expectEqual(900 * mb, revisedBudget(.raise_only, 600 * mb, 900 * mb));
+    // 0 is uncapped, the largest budget there is, on either side.
+    try testing.expectEqual(@as(u64, 0), revisedBudget(.raise_only, 0, 200 * mb));
+    try testing.expectEqual(@as(u64, 0), revisedBudget(.raise_only, 600 * mb, 0));
+    try testing.expectEqual(200 * mb, revisedBudget(.full, 0, 200 * mb));
 }
