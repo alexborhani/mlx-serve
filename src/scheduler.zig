@@ -62,8 +62,8 @@ const model_registry_mod = @import("model_registry.zig");
 const model_settings = @import("model_settings.zig");
 const model_discovery = @import("model_discovery.zig");
 const gguf_meta = @import("gguf_meta.zig");
-const arch_ds4 = if (@import("build_options").embedded_engines) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
-const arch_llama = if (@import("build_options").embedded_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
+const arch_ds4 = if (@import("build_options").ds4_engine) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
+const arch_llama = if (@import("build_options").llama_engine) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
 const mlx_gguf = @import("arch/mlx_gguf.zig");
 const log = @import("log.zig");
 const io_util = @import("io_util.zig");
@@ -3785,7 +3785,15 @@ fn waitForUnload(need: u64, avail: u64, mark: model_registry_mod.UnloadMark, now
 }
 
 fn loadAvail(_: std.Io) u64 {
-    return effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), loadGpuLimit());
+    const device = mlx.weightsInDeviceMemory();
+    const host = if (device) 0 else effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), loadGpuLimit());
+    return loadBudget(device, if (device) mlx.freeDeviceMemory() else 0, host);
+}
+
+/// Weights loaded straight into device memory (`mlx.weightLoadStream`) never page, so free VRAM
+/// is their whole bound and host RAM none; everywhere else the host reading stands.
+fn loadBudget(device_weights: bool, vram_free: u64, host_avail: u64) u64 {
+    return if (device_weights) vram_free else host_avail;
 }
 
 fn pauseLoadAvail(io: std.Io) void {
@@ -3821,6 +3829,12 @@ fn loadGpuLimit() u64 {
 fn effectiveAvailableBytes(host_avail: u64, proc_avail: u64, gpu_limit: u64) u64 {
     const avail = if (proc_avail > 0) proc_avail else host_avail;
     return if (gpu_limit > 0) @min(avail, gpu_limit) else avail;
+}
+
+test "loadBudget: device-memory weights are bounded by free VRAM alone, others by the host reading" {
+    const GB: u64 = 1024 * 1024 * 1024;
+    try std.testing.expectEqual(15 * GB, loadBudget(true, 15 * GB, 9 * GB)); // Windows VM: 13 GB fits the card
+    try std.testing.expectEqual(20 * GB, loadBudget(false, 15 * GB, 20 * GB)); // managed memory pages to RAM
 }
 
 test "settledAvail: a refused reading waits while freed memory still reaches the OS" {

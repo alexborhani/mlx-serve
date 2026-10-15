@@ -23,6 +23,8 @@
 //!     the Swift Settings pane carries the disclosure.
 
 const std = @import("std");
+const crt = @import("crt.zig");
+const os_mutex = @import("os_mutex.zig");
 const log = @import("log.zig");
 
 pub const SERVICE_TYPE = "_mlxserve._tcp";
@@ -148,8 +150,10 @@ pub fn sanitizeName(buf: []u8, raw: []const u8) []const u8 {
 /// — so the decide and rewrite layers can never disagree on which bytes are
 /// the model field.
 pub fn rewriteModelValue(alloc: std.mem.Allocator, body: []const u8, model_value: []const u8, bare_id: []const u8) ![]u8 {
-    const start = @intFromPtr(model_value.ptr) - @intFromPtr(body.ptr);
-    std.debug.assert(start + model_value.len <= body.len);
+    const at = @intFromPtr(model_value.ptr);
+    const base = @intFromPtr(body.ptr);
+    if (at < base or at - base + model_value.len > body.len) return error.ModelValueNotInBody;
+    const start = at - base;
     const out = try alloc.alloc(u8, body.len - model_value.len + bare_id.len);
     @memcpy(out[0..start], body[0..start]);
     @memcpy(out[start..][0..bare_id.len], bare_id);
@@ -157,18 +161,18 @@ pub fn rewriteModelValue(alloc: std.mem.Allocator, body: []const u8, model_value
     return out;
 }
 
-/// Collapse JSON's optional `\/` escape to `/`. Swift's JSONSerialization
-/// (and PHP's json_encode) escape every slash, so a remote id's org prefix
-/// arrives as `ddalcu\/gemma…` from the app while the peer table stores the
-/// canonical form — the same `\/` class the load-model handler documents.
-/// Returns the input verbatim (zero-copy) when there is nothing to collapse
-/// or the scratch buffer is too small.
+/// Collapse JSON's slash escapes: the optional `\/` to `/` and `\\` to `\`. Swift's
+/// JSONSerialization (and PHP's json_encode) escape every slash, so a remote id's org prefix
+/// arrives as `ddalcu\/gemma…` from the app while the peer table stores the canonical form —
+/// the same `\/` class the load-model handler documents — and a Windows path id arrives as
+/// `C:\\Users…`. Returns the input verbatim (zero-copy) when there is nothing to collapse or
+/// the scratch buffer is too small.
 pub fn unescapeJsonSlashes(buf: []u8, s: []const u8) []const u8 {
-    if (std.mem.indexOf(u8, s, "\\/") == null or s.len > buf.len) return s;
+    if ((std.mem.indexOf(u8, s, "\\/") == null and std.mem.indexOf(u8, s, "\\\\") == null) or s.len > buf.len) return s;
     var n: usize = 0;
     var i: usize = 0;
     while (i < s.len) : (i += 1) {
-        if (s[i] == '\\' and i + 1 < s.len and s[i + 1] == '/') continue;
+        if (s[i] == '\\' and i + 1 < s.len and (s[i + 1] == '/' or s[i + 1] == '\\')) i += 1;
         buf[n] = s[i];
         n += 1;
     }
@@ -355,7 +359,7 @@ pub const Lan = struct {
     /// pthread mutex, not `std.Io.Mutex`: lookups run on conn threads and the
     /// browser thread, none of which should block through an Io handle for a
     /// micro critical section (same rationale as log.zig's sink_mutex).
-    mu: std.c.pthread_mutex_t = .{},
+    mu: os_mutex.Mutex = .{},
     peers: std.StringHashMap(Peer),
     /// Set by `pokeDiscovery` (conn threads); consumed by the browser loop.
     refresh_asap: std.atomic.Value(bool) = .init(false),
@@ -370,6 +374,7 @@ pub const Lan = struct {
     known: std.StringHashMap(Known),
 
     pub fn start(alloc: std.mem.Allocator, opts: Options) !*Lan {
+        if (comptime @import("builtin").os.tag == .windows) return error.LanUnsupportedOnWindows;
         const l = try alloc.create(Lan);
         errdefer alloc.destroy(l);
         l.* = .{
@@ -453,8 +458,8 @@ pub const Lan = struct {
     /// the wait covers it too.
     pub fn lookupRemote(l: *Lan, id: []const u8) RemoteLookup {
         const rid = splitRemoteId(id) orelse return .peer_unknown;
-        _ = std.c.pthread_mutex_lock(&l.mu);
-        defer _ = std.c.pthread_mutex_unlock(&l.mu);
+        l.mu.lock();
+        defer l.mu.unlock();
         const p = l.peers.getPtr(rid.peer) orelse return .peer_unknown;
         for (p.models) |m|
             if (std.mem.eql(u8, m.id, rid.bare)) return .{ .found = .{ .ip4 = p.ip4, .port = p.port } };
@@ -472,8 +477,8 @@ pub const Lan = struct {
     /// Append the names of peers that refused us for want of a key, as JSON
     /// strings (sanitized names need no escaping).
     pub fn appendPeersNeedingKey(l: *Lan, alloc: std.mem.Allocator, buf: *std.ArrayList(u8)) !void {
-        _ = std.c.pthread_mutex_lock(&l.mu);
-        defer _ = std.c.pthread_mutex_unlock(&l.mu);
+        l.mu.lock();
+        defer l.mu.unlock();
         var it = l.peers.valueIterator();
         while (it.next()) |p| if (p.needs_key) {
             if (buf.items.len > 0) try buf.append(alloc, ',');
@@ -492,8 +497,8 @@ pub const Lan = struct {
     /// load-model no-op renders it so app flows work unchanged).
     pub fn remoteEntryFor(l: *Lan, alloc: std.mem.Allocator, id: []const u8) ?[]u8 {
         const rid = splitRemoteId(id) orelse return null;
-        _ = std.c.pthread_mutex_lock(&l.mu);
-        defer _ = std.c.pthread_mutex_unlock(&l.mu);
+        l.mu.lock();
+        defer l.mu.unlock();
         const p = l.peers.getPtr(rid.peer) orelse return null;
         for (p.models) |m|
             if (std.mem.eql(u8, m.id, rid.bare)) return alloc.dupe(u8, m.entry_json) catch null;
@@ -503,8 +508,8 @@ pub const Lan = struct {
     /// Append every discovered remote model's entry JSON to a /v1/models
     /// `data` array under construction (comma-managed by buffer length).
     pub fn appendRemoteEntries(l: *Lan, alloc: std.mem.Allocator, buf: *std.ArrayList(u8)) !void {
-        _ = std.c.pthread_mutex_lock(&l.mu);
-        defer _ = std.c.pthread_mutex_unlock(&l.mu);
+        l.mu.lock();
+        defer l.mu.unlock();
         var it = l.peers.valueIterator();
         while (it.next()) |p| for (p.models) |m| {
             if (buf.items.len > 0) try buf.append(alloc, ',');
@@ -529,8 +534,8 @@ pub const Lan = struct {
     }
 
     fn removePeer(l: *Lan, display: []const u8) void {
-        _ = std.c.pthread_mutex_lock(&l.mu);
-        defer _ = std.c.pthread_mutex_unlock(&l.mu);
+        l.mu.lock();
+        defer l.mu.unlock();
         if (l.peers.fetchRemove(display)) |kv| {
             var p = kv.value;
             p.deinit(l.alloc);
@@ -542,8 +547,8 @@ pub const Lan = struct {
             freePeerModels(l.alloc, models);
             return;
         };
-        _ = std.c.pthread_mutex_lock(&l.mu);
-        defer _ = std.c.pthread_mutex_unlock(&l.mu);
+        l.mu.lock();
+        defer l.mu.unlock();
         if (l.peers.fetchRemove(display)) |kv| {
             var old = kv.value;
             old.deinit(l.alloc);
@@ -631,8 +636,8 @@ pub const Lan = struct {
             return .installed;
         };
         const changed = blk: {
-            _ = std.c.pthread_mutex_lock(&l.mu);
-            defer _ = std.c.pthread_mutex_unlock(&l.mu);
+            l.mu.lock();
+            defer l.mu.unlock();
             const p = l.peers.getPtr(display) orelse break :blk true;
             break :blk p.models.len != fetched.len;
         };
@@ -847,9 +852,7 @@ fn threadMain(l: *Lan) void {
             }
         }
         if (n == 0) {
-            // std.time.sleep was removed in Zig 0.16; this thread has no Io.
-            const ts = std.c.timespec{ .sec = 0, .nsec = 500_000_000 };
-            _ = std.c.nanosleep(&ts, null);
+            crt.sleepMs(500); // this thread has no Io
             continue;
         }
         const ready = std.posix.poll(fds[0..n], 1000) catch break;
@@ -935,6 +938,7 @@ fn fileStamp(path: [*:0]const u8) i64 {
 /// Regular files only, opened non-blocking: a FIFO at the path would park the
 /// browser thread in `open` until a writer came, and discovery with it.
 fn readSmallFile(alloc: std.mem.Allocator, path: [*:0]const u8) ?[]u8 {
+    if (comptime @import("builtin").os.tag == .windows) return null; // LAN is off on Windows
     const fd = std.c.open(path, .{ .ACCMODE = .RDONLY, .NONBLOCK = true }, @as(std.c.mode_t, 0));
     if (fd < 0) return null;
     defer _ = std.c.close(fd);
@@ -973,11 +977,7 @@ const AuthLine = struct {
 
 /// Monotonic milliseconds without an `Io` handle (this thread has none —
 /// same rationale as log.zig's raw-libc sink).
-fn monoMs() i64 {
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(.MONOTONIC, &ts);
-    return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), 1_000_000);
-}
+const monoMs = crt.monotonicMs;
 
 /// One dns_sd ref pumped until its callback flips `done` or the deadline hits.
 fn pumpUntil(ref: DNSServiceRef, done: *const bool, timeout_ms: i64) bool {
@@ -1111,6 +1111,7 @@ fn fetchPeerModels(alloc: std.mem.Allocator, ip4: [4]u8, port: u16, peer_display
 /// stream — the client sees a closed socket, the peer sees a disconnect and
 /// cancels its slot.
 pub fn tunnel(remote: Remote, method: []const u8, raw_path: []const u8, body: []const u8, key: ?[]const u8, conn: anytype) error{PeerUnreachable}!void {
+    if (comptime @import("builtin").os.tag == .windows) return error.PeerUnreachable; // LAN is off on Windows
     const fd = connectTimeout(remote.ip4, remote.port, 3000) catch return error.PeerUnreachable;
     defer _ = std.c.close(fd);
     var head_buf: [2048]u8 = undefined;
@@ -1265,6 +1266,12 @@ test "lan: sanitizeName collapses hostile chars and never returns empty" {
     try t.expectEqualStrings("plain-name_1.local", sanitizeName(&buf, "plain-name_1.local"));
 }
 
+test "lan: rewriteModelValue refuses a model value that is not a slice of the body" {
+    const body = "{\"model\":\"C:\\\\m@local\"}";
+    const canonical = "C:\\m@local"; // an unescaped copy, as handleConnection used to pass
+    try t.expectError(error.ModelValueNotInBody, rewriteModelValue(t.allocator, body, canonical, "C:\\m"));
+}
+
 test "lan: rewriteModelValue splices the aliased model value in place" {
     const a = t.allocator;
     const body = "{\"model\":\"qwen3.6-27b@Studio\",\"messages\":[{\"role\":\"user\",\"content\":\"hi @Studio\"}]}";
@@ -1332,6 +1339,8 @@ test "lan: JSON-escaped slashes canonicalize (Swift clients send org\\/name)" {
     try t.expect(unescapeJsonSlashes(&buf, plain).ptr == plain.ptr);
     // Only the two-byte sequence `\/` collapses; other backslashes survive.
     try t.expectEqualStrings("a\\b/c", unescapeJsonSlashes(&buf, "a\\b\\/c"));
+    // A Windows path id arrives with its backslashes escaped.
+    try t.expectEqualStrings("C:\\Users\\m", unescapeJsonSlashes(&buf, "C:\\\\Users\\\\m"));
     // Oversized input degrades to verbatim rather than truncating.
     var tiny: [4]u8 = undefined;
     try t.expectEqualStrings("x\\/y", unescapeJsonSlashes(tiny[0..2], "x\\/y"));

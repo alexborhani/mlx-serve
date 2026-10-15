@@ -1,4 +1,5 @@
 const std = @import("std");
+const crt = @import("crt.zig");
 const builtin = @import("builtin");
 const is_macos = builtin.os.tag == .macos;
 
@@ -147,6 +148,7 @@ pub fn getProcAvailableMemBytes() u64 {
 
 /// Total physical RAM (hw.memsize on Darwin; /proc/meminfo on Linux). 0 on failure.
 pub fn getTotalMemBytes() u64 {
+    if (comptime builtin.os.tag == .windows) return windowsMemStatus().ullTotalPhys;
     if (comptime !builtin.os.tag.isDarwin()) return linuxMemInfoKib("MemTotal:") * 1024;
     var total_mem: u64 = 0;
     var len: usize = @sizeOf(u64);
@@ -155,6 +157,7 @@ pub fn getTotalMemBytes() u64 {
 }
 
 pub fn getAvailableMemBytes() u64 {
+    if (comptime builtin.os.tag == .windows) return windowsMemStatus().ullAvailPhys;
     if (comptime !builtin.os.tag.isDarwin()) return linuxMemInfoKib("MemAvailable:") * 1024;
     var total_mem: u64 = 0;
     var len: usize = @sizeOf(u64);
@@ -168,6 +171,26 @@ pub fn getAvailableMemBytes() u64 {
     if (host_statistics64(mach_host_self(), 4, @ptrCast(&vm), &count) != 0) return 0;
 
     return computeAvailableBytes(total_mem, vm.free_count, vm.speculative_count, vm.external_page_count, vm.wire_count, vm.compressor_page_count, page);
+}
+
+const MemoryStatusEx = extern struct {
+    dwLength: u32 = @sizeOf(MemoryStatusEx),
+    dwMemoryLoad: u32 = 0,
+    ullTotalPhys: u64 = 0,
+    ullAvailPhys: u64 = 0,
+    ullTotalPageFile: u64 = 0,
+    ullAvailPageFile: u64 = 0,
+    ullTotalVirtual: u64 = 0,
+    ullAvailVirtual: u64 = 0,
+    ullAvailExtendedVirtual: u64 = 0,
+};
+extern "kernel32" fn GlobalMemoryStatusEx(status: *MemoryStatusEx) callconv(.winapi) i32;
+
+/// Zeroed (callers' "unknown") when the call fails.
+fn windowsMemStatus() MemoryStatusEx {
+    var s: MemoryStatusEx = .{};
+    if (GlobalMemoryStatusEx(&s) == 0) return .{};
+    return s;
 }
 
 /// One `/proc/meminfo` field in KiB ("MemTotal:", "MemAvailable:", …).
@@ -205,10 +228,10 @@ fn readProcFile(path: []const u8, buf: []u8) ?usize {
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     @memcpy(pbuf[0..path.len], path);
     pbuf[path.len] = 0;
-    const fd = std.c.open(pbuf[0..path.len :0].ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    const fd = crt.openRead(pbuf[0..path.len :0].ptr);
     if (fd < 0) return null;
-    defer _ = std.c.close(fd);
-    const n = std.c.read(fd, buf.ptr, buf.len);
+    defer crt.close(fd);
+    const n = crt.read(fd, buf);
     if (n <= 0) return null;
     return @intCast(n);
 }

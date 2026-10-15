@@ -9,6 +9,9 @@ pub const log = @import("log.zig");
 
 test {
     _ = @import("log.zig");
+    _ = @import("os_mutex.zig");
+    _ = @import("crt.zig");
+    _ = @import("win_socket.zig");
     _ = @import("arch/mlx_gguf.zig");
     _ = @import("version.zig");
     _ = @import("chat.zig");
