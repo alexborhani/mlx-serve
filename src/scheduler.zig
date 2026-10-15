@@ -1443,6 +1443,9 @@ pub const Scheduler = struct {
     /// inference-thread state, freed on every model switch, so the guard reads this number
     /// and never the pointer.
     resident_hot_cache_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// When the last slot finished, ms on the boot clock; 0 = none yet. The memory that turn
+    /// returned shows as free only over the seconds that follow.
+    last_finish_ms: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
     /// KV + recurrent state the decoding slots own, published once per tick (`/props`).
     resident_live_kv_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// Per-slot context snapshot for `/metrics.json`, published with the above under `queue_mu`.
@@ -2659,6 +2662,29 @@ pub fn holdsForMemory(fits: bool, live_company: bool) bool {
     return !fits and live_company;
 }
 
+/// How long a finished turn's memory takes to show as free: MLX returns it at once, the
+/// system-free figure the bill reads recovers over seconds. A prompt that lands inside this
+/// window is re-billed until it fits or the window ends, instead of refused on the first read.
+pub const TURN_BOUNDARY_SETTLE_MS: i64 = 2000;
+/// The re-bill cadence inside the window, on either thread.
+pub const TURN_BOUNDARY_REBILL_MS: i64 = 100;
+
+/// Is `now_ms` inside the settle window after the last finish? 0 = no turn has finished.
+pub fn withinTurnBoundary(now_ms: i64, last_finish_ms: i64, window_ms: i64) bool {
+    if (last_finish_ms == 0) return false;
+    return now_ms - last_finish_ms < window_ms;
+}
+
+pub fn turnBoundarySettling(sch: *const Scheduler, io: std.Io) bool {
+    return withinTurnBoundary(io_util.nowMsMonotonic(io), sch.last_finish_ms.load(.monotonic), TURN_BOUNDARY_SETTLE_MS);
+}
+
+/// A pending prompt with nothing live holds through the settle window, then takes the refusal:
+/// the window is what ends the wait.
+pub fn holdsWhileSettling(settling: bool, waited_ms: i64, window_ms: i64) bool {
+    return settling and waited_ms < window_ms;
+}
+
 /// Does a prefill needing `need` fit `avail` beside siblings' unallocated promises, a running
 /// media job's reserve, and the sibling margin? Metal OOM is uncatchable, so a media step's
 /// transients are billed before chat may take them.
@@ -2690,7 +2716,9 @@ fn slotHoldsForMemory(sch: *Scheduler, slot: *Slot) bool {
     var active_now: usize = 0;
     _ = mlx.mlx_get_active_memory(&active_now);
     const fits = admissionFits(bill[0], bill[1], sch.promise_ledger.outstanding(active_now), sch.gen_reserve_bytes, live);
-    if (!holdsForMemory(fits, live > 0 or sch.gen_reserve_bytes > 0)) {
+    const waited_ms: i64 = @intCast(@divTrunc(slot.request_start_ts.untilNow(sch.io, .boot).nanoseconds, std.time.ns_per_ms));
+    const settling = holdsWhileSettling(turnBoundarySettling(sch, sch.io), waited_ms, TURN_BOUNDARY_SETTLE_MS);
+    if (!holdsForMemory(fits, live > 0 or sch.gen_reserve_bytes > 0 or settling)) {
         if (slot.memory_promised == 0) {
             slot.memory_promised = bill[0];
             sch.promise_ledger.admit(bill[0], active_now);
@@ -2699,8 +2727,14 @@ fn slotHoldsForMemory(sch: *Scheduler, slot: *Slot) bool {
     }
     if (!slot.memory_hold_logged) {
         slot.memory_hold_logged = true;
-        log.info("[admission] held: {d} tokens do not fit beside {d} live request(s) and {d} MB of media job; waiting for one to finish\n", .{ slot.full_prompt.len, live, sch.gen_reserve_bytes >> 20 });
+        if (live > 0 or sch.gen_reserve_bytes > 0) {
+            log.info("[admission] held: {d} tokens do not fit beside {d} live request(s) and {d} MB of media job; waiting for one to finish\n", .{ slot.full_prompt.len, live, sch.gen_reserve_bytes >> 20 });
+        } else {
+            log.info("[admission] held: {d} tokens do not fit {d} ms after the last turn finished; re-billing for up to {d} ms\n", .{ slot.full_prompt.len, waited_ms, TURN_BOUNDARY_SETTLE_MS });
+        }
     }
+    // With nothing live, no decode tick paces the loop: pace the re-bill here.
+    if (live == 0 and sch.gen_reserve_bytes == 0) std.Io.sleep(sch.io, .fromMilliseconds(TURN_BOUNDARY_REBILL_MS), .real) catch {};
     return true;
 }
 
@@ -6500,6 +6534,7 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     // so without this a short turn hands everything it stranded to the next one
     // and the process footprint ratchets across a session (issue #110).
     _ = mlx.mlx_clear_cache();
+    sch.last_finish_ms.store(io_util.nowMsMonotonic(sch.io), .monotonic);
 }
 
 /// ds4 prefill: sync the model's ONE persistent session to the full prompt.
@@ -11814,4 +11849,16 @@ test "loop recovery: an answer-side loop and an unarmed request are still cut" {
     const closed = [_]u32{ 5, 6, CLOSE, 7, 8 };
     try testing.expectEqual(LoopAction.cut, loopRecoveryAction(&tb, &closed, 5, 4096));
     try testing.expectEqual(LoopAction.cut, loopRecoveryAction(null, &closed, 5, 4096));
+}
+
+test "a prompt that lands inside the settle window after a finish holds, then takes the refusal" {
+    try testing.expect(withinTurnBoundary(1_500, 1_000, 2_000));
+    try testing.expect(!withinTurnBoundary(3_000, 1_000, 2_000));
+    try testing.expect(!withinTurnBoundary(1_500, 0, 2_000)); // nothing has finished yet
+    try testing.expect(holdsWhileSettling(true, 300, 2_000));
+    try testing.expect(!holdsWhileSettling(true, 2_000, 2_000)); // the window ends the wait
+    try testing.expect(!holdsWhileSettling(false, 300, 2_000));
+    // The hold rides the same gate as live company: never a wait that nothing ends.
+    try testing.expect(holdsForMemory(false, holdsWhileSettling(true, 300, 2_000)));
+    try testing.expect(!holdsForMemory(false, holdsWhileSettling(true, 2_000, 2_000)));
 }

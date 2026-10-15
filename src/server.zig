@@ -6663,6 +6663,23 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids:
         });
         return true;
     }
+    // Right after a finish the free figure is still catching up with the memory that turn
+    // returned: re-bill through the settle window before taking the refusal.
+    if (needed > available) if (global_scheduler) |sch| {
+        if (scheduler_mod.turnBoundarySettling(sch, stream.io)) {
+            var waited_ms: i64 = 0;
+            while (waited_ms < scheduler_mod.TURN_BOUNDARY_SETTLE_MS and !bill.fits()) {
+                std.Io.sleep(stream.io, .fromMilliseconds(scheduler_mod.TURN_BOUNDARY_REBILL_MS), .real) catch break;
+                waited_ms += scheduler_mod.TURN_BOUNDARY_REBILL_MS;
+                bill = prefillAdmissionBill(config, prompt_len, max_tokens, kv_override, unchunked_prefill, prompt_ids, .{ .mtp_on = enable_mtp });
+                bill.needed += media_bytes;
+            }
+            if (bill.fits()) {
+                log.info("  prompt {d} tokens fits ~{d} ms after the last turn finished: ~{d}MB needed, ~{d}MB available — admitting\n", .{ prompt_len, waited_ms, bill.needed / (1024 * 1024), bill.available / (1024 * 1024) });
+                return true;
+            }
+        }
+    };
     if (needed > available) if (global_scheduler) |sch| {
         const Rebill = struct {
             sch: *scheduler_mod.Scheduler,

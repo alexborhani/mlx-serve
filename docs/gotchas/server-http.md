@@ -2668,6 +2668,24 @@ Fix: before refusing, `checkAttentionMemory` unloads idle resident models least 
 after each, via `fitAfterUnloadingIdle`.
 Guard: `a prompt that does not fit unloads idle models, oldest first, until it fits` (server.zig).
 
+## A prompt that landed right after a finish was refused on a stale free figure (2026-10-14, #854)
+
+Defect: an agent's next turn, sent as soon as the previous one ended with nothing else live, got a
+400 for memory five times in one 25-minute run on a 24 GB M2, while the machine held the memory
+the finished turn had just returned.
+
+Cause: MLX returns a turn's memory at once; the system-free figure the bill reads recovers over
+seconds (the #364 trap). The scheduler's hold only waits beside live requests, since alone it would
+wait for something that never comes, and the connection thread refused on its first reading.
+
+Fix: `finishSlot` stamps `last_finish_ms`. For `TURN_BOUNDARY_SETTLE_MS` after it, both doors
+re-bill every `TURN_BOUNDARY_REBILL_MS` until the prompt fits or the window ends: the connection
+thread in `checkAttentionMemory`, the scheduler through `holdsWhileSettling`, which the window
+itself ends. With nothing live, the loop never parks on a pending slot, so the settle hold paces
+itself. A refusal that stands costs up to two seconds more than before.
+Guard: `a prompt that lands inside the settle window after a finish holds, then takes the refusal`
+(scheduler.zig).
+
 ## A 16 GB Mac advertised 870 tokens beside a big model (2026-10-11)
 
 Defect: on an M4 16 GB, Qwen3.5-9B (7.6 GB) auto-sized to 870 tokens, gemma-4-e4b 8-bit to 870 and
