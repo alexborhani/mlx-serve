@@ -2700,13 +2700,13 @@ pub const HotPrefixCache = struct {
         log.info("  [hot-cache] shed {d} checkpoints to fit the byte budget ({d} kept)\n", .{ shed, n });
     }
 
-    /// Re-clamp the byte budget after the machine's residency changed (a model loaded
-    /// or unloaded beside this one). Shrinking evicts LRU down to the new cap; 0 = uncapped.
     /// Would `next` cap the cache below `current`? 0 is uncapped.
     pub fn budgetShrinks(current: u64, next: u64) bool {
         return next != 0 and (current == 0 or next < current);
     }
 
+    /// Re-clamp the byte budget after the machine's residency changed (a model loaded
+    /// or unloaded beside this one). Shrinking evicts LRU down to the new cap; 0 = uncapped.
     pub fn setBudget(self: *HotPrefixCache, max_kv_bytes: u64) void {
         if (max_kv_bytes == self.max_kv_bytes) return;
         if (max_kv_bytes >> 20 != self.max_kv_bytes >> 20)
